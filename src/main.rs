@@ -2,6 +2,7 @@ use poise::serenity_prelude as serenity;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 
 struct Data {
     active_timer: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -30,19 +31,24 @@ async fn update_voice_channel_statuses(
     let channels = match guild_id.channels(http).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to fetch channels: {e}");
+            error!(guild_id = %guild_id, error = %e, "failed to fetch guild channels");
             return;
         }
     };
 
+    let mut updated = 0u32;
     for (_id, mut channel) in channels {
         if channel.kind == serenity::model::channel::ChannelType::Voice {
             let builder = serenity::builder::EditChannel::new().status(status_text);
-            if let Err(e) = channel.edit(http, builder).await {
-                eprintln!("Failed to update status on channel {}: {e}", channel.name);
+            match channel.edit(http, builder).await {
+                Ok(_) => updated += 1,
+                Err(e) => {
+                    warn!(guild_id = %guild_id, channel_name = %channel.name, channel_id = %channel.id, error = %e, "failed to update voice channel status");
+                }
             }
         }
     }
+    info!(guild_id = %guild_id, channels_updated = updated, status_text = %status_text, "updated voice channel statuses");
 }
 
 /// Check if the invoking user has a role named "storyteller" (case-insensitive).
@@ -62,10 +68,12 @@ async fn has_storyteller_role(ctx: Context<'_>) -> Result<bool, Error> {
     for role_id in &member.roles {
         if let Some(role) = roles.get(role_id) {
             if role.name.eq_ignore_ascii_case("storyteller") {
+                info!(guild_id = %guild_id, user = %ctx.author().name, user_id = %ctx.author().id, "role check passed: user has storyteller role");
                 return Ok(true);
             }
         }
     }
+    warn!(guild_id = %guild_id, user = %ctx.author().name, user_id = %ctx.author().id, "role check failed: user lacks storyteller role");
     Ok(false)
 }
 
@@ -82,6 +90,8 @@ async fn gather(
     #[description = "How long until gathering"] duration: GatherDuration,
     #[description = "Custom duration in minutes (1-60)"] custom_minutes: Option<u64>,
 ) -> Result<(), Error> {
+    info!(user = %ctx.author().name, user_id = %ctx.author().id, guild_id = ?ctx.guild_id(), duration = ?duration, custom_minutes = ?custom_minutes, "/gather command invoked");
+
     if !has_storyteller_role(ctx).await? {
         reply_ephemeral(ctx, "You need the **Storyteller** role to use this command.").await?;
         return Ok(());
@@ -93,11 +103,13 @@ async fn gather(
         GatherDuration::Test => 1,
         GatherDuration::Custom => match custom_minutes {
             Some(m) if (1..=60).contains(&m) => m,
-            Some(_) => {
+            Some(m) => {
+                warn!(user = %ctx.author().name, custom_minutes = m, "invalid custom duration");
                 reply_ephemeral(ctx, "Custom duration must be between 1 and 60 minutes.").await?;
                 return Ok(());
             }
             None => {
+                warn!(user = %ctx.author().name, "custom duration selected but custom_minutes not provided");
                 reply_ephemeral(ctx, "Please provide `custom_minutes` when using Custom duration.").await?;
                 return Ok(());
             }
@@ -105,12 +117,14 @@ async fn gather(
     };
 
     let is_test = matches!(duration, GatherDuration::Test);
+    info!(minutes = minutes, is_test = is_test, "resolved gather duration");
 
     // Cancel any existing timer
     {
         let mut timer = ctx.data().active_timer.lock().await;
         if let Some(handle) = timer.take() {
             handle.abort();
+            info!("cancelled existing timer (replaced by new /gather)");
         }
     }
 
@@ -130,6 +144,7 @@ async fn gather(
         ))
         .await?;
     let countdown_msg_id = countdown_msg.id;
+    info!(channel_id = %channel_id, message_id = %countdown_msg_id, end_timestamp = end_timestamp, "sent countdown message");
 
     // Reply to the storyteller with ephemeral confirmation
     reply_ephemeral(ctx, &format!("Timer started for {minutes} minute(s).")).await?;
@@ -150,12 +165,17 @@ async fn gather(
     let handle = tokio::spawn(async move {
         let total_seconds = minutes * 60;
         let mut elapsed: u64 = 0;
+        info!(guild_id = %guild_id, total_seconds = total_seconds, "background timer started");
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             elapsed += 60;
+            let remaining_secs = total_seconds.saturating_sub(elapsed);
+            info!(guild_id = %guild_id, elapsed_secs = elapsed, remaining_secs = remaining_secs, "timer tick");
 
             if elapsed >= total_seconds {
+                info!(guild_id = %guild_id, channel_id = %channel_id, is_test = is_test, "timer expired, sending final message");
+
                 // Send final message first so the ping feels on time
                 if is_test {
                     let _ = channel_id
@@ -168,17 +188,21 @@ async fn gather(
                 }
 
                 // Then clean up: delete the old countdown message and clear statuses
-                let _ = channel_id.delete_message(&http2, countdown_msg_id).await;
+                match channel_id.delete_message(&http2, countdown_msg_id).await {
+                    Ok(_) => info!(message_id = %countdown_msg_id, "deleted countdown message"),
+                    Err(e) => warn!(message_id = %countdown_msg_id, error = %e, "failed to delete countdown message"),
+                }
                 update_voice_channel_statuses(&http2, guild_id, "").await;
+                info!(guild_id = %guild_id, "cleared voice channel statuses");
 
                 // Clean up handle
                 let mut timer = active_timer.lock().await;
                 *timer = None;
+                info!(guild_id = %guild_id, "timer complete, handle cleaned up");
                 return;
             }
 
             // Update voice channel statuses with remaining time (plain text fallback)
-            let remaining_secs = total_seconds - elapsed;
             let remaining_mins = (remaining_secs + 59) / 60; // round up
             update_voice_channel_statuses(
                 &http2,
@@ -194,6 +218,7 @@ async fn gather(
         let mut timer = ctx.data().active_timer.lock().await;
         *timer = Some(handle);
     }
+    info!(guild_id = %guild_id, "timer handle stored");
 
     Ok(())
 }
@@ -201,6 +226,8 @@ async fn gather(
 /// Cancel the active gather timer.
 #[poise::command(slash_command, guild_only)]
 async fn cancel(ctx: Context<'_>) -> Result<(), Error> {
+    info!(user = %ctx.author().name, user_id = %ctx.author().id, guild_id = ?ctx.guild_id(), "/cancel command invoked");
+
     if !has_storyteller_role(ctx).await? {
         reply_ephemeral(ctx, "You need the **Storyteller** role to use this command.").await?;
         return Ok(());
@@ -215,8 +242,10 @@ async fn cancel(ctx: Context<'_>) -> Result<(), Error> {
         let http = ctx.serenity_context().http.clone();
         update_voice_channel_statuses(&http, guild_id, "").await;
 
+        info!(guild_id = %guild_id, user = %ctx.author().name, "timer cancelled via /cancel, voice statuses cleared");
         reply_ephemeral(ctx, "Timer cancelled, voice channel statuses cleared.").await?;
     } else {
+        info!(user = %ctx.author().name, "no active timer to cancel");
         reply_ephemeral(ctx, "No active timer to cancel.").await?;
     }
 
@@ -225,17 +254,20 @@ async fn cancel(ctx: Context<'_>) -> Result<(), Error> {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt().init();
+
     let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN env var not set");
+    info!("starting bot");
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: vec![gather(), cancel()],
             ..Default::default()
         })
-        .setup(move |ctx, _ready, framework| {
+        .setup(move |ctx, ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                println!("Bot is ready!");
+                info!(bot_user = %ready.user.name, bot_id = %ready.user.id, "bot is ready, commands registered globally");
                 Ok(Data {
                     active_timer: Arc::new(Mutex::new(None)),
                 })
@@ -250,6 +282,6 @@ async fn main() {
         .expect("Failed to create client");
 
     if let Err(e) = client.start().await {
-        eprintln!("Client error: {e}");
+        error!(error = %e, "client error");
     }
 }
