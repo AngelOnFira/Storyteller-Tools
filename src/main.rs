@@ -135,7 +135,7 @@ async fn gather(
     let end_timestamp = now + minutes * 60;
 
     // Send visible message with Discord's live-updating relative timestamp
-    let mode_note = if is_test { " *(test mode — no @everyone ping)*" } else { "" };
+    let mode_note = if is_test { " *(test mode — no ping)*" } else { "" };
     let channel_id = ctx.channel_id();
     let http = ctx.serenity_context().http.clone();
     let countdown_msg = channel_id
@@ -183,7 +183,7 @@ async fn gather(
                         .await;
                 } else {
                     let _ = channel_id
-                        .say(&http2, "@everyone Time's up! Everyone back to **Town Square**!")
+                        .say(&http2, "<@&1483859041196310570> Time's up! Everyone back to **Town Square**!")
                         .await;
                 }
 
