@@ -36,18 +36,24 @@ async fn update_voice_channel_statuses(
         }
     };
 
-    let mut updated = 0u32;
-    for (_id, mut channel) in channels {
-        if channel.kind == serenity::model::channel::ChannelType::Voice {
+    let edits = channels.into_iter().filter_map(|(_id, mut channel)| {
+        if channel.kind != serenity::model::channel::ChannelType::Voice {
+            return None;
+        }
+        Some(async move {
             let builder = serenity::builder::EditChannel::new().status(status_text);
             match channel.edit(http, builder).await {
-                Ok(_) => updated += 1,
+                Ok(_) => Ok(()),
                 Err(e) => {
                     warn!(guild_id = %guild_id, channel_name = %channel.name, channel_id = %channel.id, error = %e, "failed to update voice channel status");
+                    Err(())
                 }
             }
-        }
-    }
+        })
+    });
+
+    let results = futures::future::join_all(edits).await;
+    let updated = results.iter().filter(|r| r.is_ok()).count() as u32;
     info!(guild_id = %guild_id, channels_updated = updated, status_text = %status_text, "updated voice channel statuses");
 }
 
@@ -79,7 +85,12 @@ async fn has_storyteller_role(ctx: Context<'_>) -> Result<bool, Error> {
 
 /// Send an ephemeral reply only the command user can see.
 async fn reply_ephemeral(ctx: Context<'_>, content: &str) -> Result<(), Error> {
-    ctx.send(poise::CreateReply::default().content(content).ephemeral(true)).await?;
+    ctx.send(
+        poise::CreateReply::default()
+            .content(content)
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 
@@ -93,7 +104,11 @@ async fn gather(
     info!(user = %ctx.author().name, user_id = %ctx.author().id, guild_id = ?ctx.guild_id(), duration = ?duration, custom_minutes = ?custom_minutes, "/gather command invoked");
 
     if !has_storyteller_role(ctx).await? {
-        reply_ephemeral(ctx, "You need the **Storyteller** role to use this command.").await?;
+        reply_ephemeral(
+            ctx,
+            "You need the **Storyteller** role to use this command.",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -110,14 +125,22 @@ async fn gather(
             }
             None => {
                 warn!(user = %ctx.author().name, "custom duration selected but custom_minutes not provided");
-                reply_ephemeral(ctx, "Please provide `custom_minutes` when using Custom duration.").await?;
+                reply_ephemeral(
+                    ctx,
+                    "Please provide `custom_minutes` when using Custom duration.",
+                )
+                .await?;
                 return Ok(());
             }
         },
     };
 
     let is_test = matches!(duration, GatherDuration::Test);
-    info!(minutes = minutes, is_test = is_test, "resolved gather duration");
+    info!(
+        minutes = minutes,
+        is_test = is_test,
+        "resolved gather duration"
+    );
 
     // Cancel any existing timer
     {
@@ -132,16 +155,23 @@ async fn gather(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let total_duration = std::time::Duration::from_secs(minutes * 60);
+    let deadline = tokio::time::Instant::now() + total_duration;
     let end_timestamp = now + minutes * 60;
 
     // Send visible message with Discord's live-updating relative timestamp
-    let mode_note = if is_test { " *(test mode — no ping)*" } else { "" };
+    let mode_note = if is_test {
+        " *(test mode — no ping)*"
+    } else {
+        ""
+    };
     let channel_id = ctx.channel_id();
     let http = ctx.serenity_context().http.clone();
     let countdown_msg = channel_id
-        .say(&http, format!(
-            "Return to **Town Square** <t:{end_timestamp}:R>{mode_note}"
-        ))
+        .say(
+            &http,
+            format!("Return to **Town Square** <t:{end_timestamp}:R>{mode_note}"),
+        )
         .await?;
     let countdown_msg_id = countdown_msg.id;
     info!(channel_id = %channel_id, message_id = %countdown_msg_id, end_timestamp = end_timestamp, "sent countdown message");
@@ -151,66 +181,49 @@ async fn gather(
 
     // Set initial voice channel statuses with timestamp
     let guild_id = ctx.guild_id().unwrap();
-    update_voice_channel_statuses(
-        &http,
-        guild_id,
-        &format!("Return <t:{end_timestamp}:R>"),
-    )
-    .await;
+    update_voice_channel_statuses(&http, guild_id, &format!("Return <t:{end_timestamp}:R>")).await;
 
     // Spawn background countdown task
     let active_timer = ctx.data().active_timer.clone();
     let http2 = http.clone();
 
     let handle = tokio::spawn(async move {
-        let total_seconds = minutes * 60;
-        let mut elapsed: u64 = 0;
-        info!(guild_id = %guild_id, total_seconds = total_seconds, "background timer started");
+        info!(guild_id = %guild_id, total_seconds = minutes * 60, "background timer started");
 
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            elapsed += 60;
-            let remaining_secs = total_seconds.saturating_sub(elapsed);
-            info!(guild_id = %guild_id, elapsed_secs = elapsed, remaining_secs = remaining_secs, "timer tick");
+        tokio::time::sleep_until(deadline).await;
+        info!(guild_id = %guild_id, channel_id = %channel_id, is_test = is_test, "timer expired, sending final message");
 
-            if elapsed >= total_seconds {
-                info!(guild_id = %guild_id, channel_id = %channel_id, is_test = is_test, "timer expired, sending final message");
-
-                // Send final message first so the ping feels on time
-                if is_test {
-                    let _ = channel_id
-                        .say(&http2, "Time's up! Everyone back to **Town Square**! *(test mode — no ping)*")
-                        .await;
-                } else {
-                    let _ = channel_id
-                        .say(&http2, "<@&1483859041196310570> Time's up! Everyone back to **Town Square**!")
-                        .await;
-                }
-
-                // Then clean up: delete the old countdown message and clear statuses
-                match channel_id.delete_message(&http2, countdown_msg_id).await {
-                    Ok(_) => info!(message_id = %countdown_msg_id, "deleted countdown message"),
-                    Err(e) => warn!(message_id = %countdown_msg_id, error = %e, "failed to delete countdown message"),
-                }
-                update_voice_channel_statuses(&http2, guild_id, "").await;
-                info!(guild_id = %guild_id, "cleared voice channel statuses");
-
-                // Clean up handle
-                let mut timer = active_timer.lock().await;
-                *timer = None;
-                info!(guild_id = %guild_id, "timer complete, handle cleaned up");
-                return;
-            }
-
-            // Update voice channel statuses with remaining time (plain text fallback)
-            let remaining_mins = (remaining_secs + 59) / 60; // round up
-            update_voice_channel_statuses(
-                &http2,
-                guild_id,
-                &format!("Return to Town Square in {remaining_mins} min"),
-            )
-            .await;
+        // Send final message first so the ping feels on time
+        if is_test {
+            let _ = channel_id
+                .say(
+                    &http2,
+                    "Time's up! Everyone back to **Town Square**! *(test mode — no ping)*",
+                )
+                .await;
+        } else {
+            let _ = channel_id
+                .say(
+                    &http2,
+                    "<@&1483859041196310570> Time's up! Everyone back to **Town Square**!",
+                )
+                .await;
         }
+
+        // Then clean up: delete the old countdown message and clear statuses
+        match channel_id.delete_message(&http2, countdown_msg_id).await {
+            Ok(_) => info!(message_id = %countdown_msg_id, "deleted countdown message"),
+            Err(e) => {
+                warn!(message_id = %countdown_msg_id, error = %e, "failed to delete countdown message")
+            }
+        }
+        update_voice_channel_statuses(&http2, guild_id, "").await;
+        info!(guild_id = %guild_id, "cleared voice channel statuses");
+
+        // Clean up handle
+        let mut timer = active_timer.lock().await;
+        *timer = None;
+        info!(guild_id = %guild_id, "timer complete, handle cleaned up");
     });
 
     // Store the handle
@@ -229,7 +242,11 @@ async fn cancel(ctx: Context<'_>) -> Result<(), Error> {
     info!(user = %ctx.author().name, user_id = %ctx.author().id, guild_id = ?ctx.guild_id(), "/cancel command invoked");
 
     if !has_storyteller_role(ctx).await? {
-        reply_ephemeral(ctx, "You need the **Storyteller** role to use this command.").await?;
+        reply_ephemeral(
+            ctx,
+            "You need the **Storyteller** role to use this command.",
+        )
+        .await?;
         return Ok(());
     }
 
